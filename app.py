@@ -12,7 +12,6 @@ app = Flask(__name__)
 
 # Environment variables
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
-PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v24.0")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEETS_CREDS = os.environ.get("GOOGLE_SHEETS_CREDS")
@@ -33,6 +32,18 @@ ad_products_sheet = sheet.worksheet("Ad_Products")
 conversations_sheet = sheet.worksheet("Conversations")
 leads_sheet = sheet.worksheet("Leads")
 handoffs_sheet = sheet.worksheet("Handoffs")
+
+# Map page IDs to their access tokens
+PAGE_MAP = {
+    os.environ.get("PAGE_ID_1"): os.environ.get("PAGE_ACCESS_TOKEN_1"),
+    os.environ.get("PAGE_ID_2"): os.environ.get("PAGE_ACCESS_TOKEN_2"),
+    os.environ.get("PAGE_ID_3"): os.environ.get("PAGE_ACCESS_TOKEN_3"),
+    os.environ.get("PAGE_ID_4"): os.environ.get("PAGE_ACCESS_TOKEN_4"),
+}
+
+def get_page_token(page_id: str) -> str:
+    """Return the correct page token for this page id."""
+    return PAGE_MAP.get(str(page_id))
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -69,6 +80,10 @@ def webhook():
 
         if "entry" in data:
             for entry in data["entry"]:
+                page_id = entry.get("id")  # the Page receiving this message
+                page_token = get_page_token(page_id)
+                print(f"Incoming event for page {page_id}", flush=True)
+
                 messaging_events = entry.get("messaging", [])
                 for event in messaging_events:
                     sender_id = event["sender"]["id"]
@@ -82,7 +97,7 @@ def webhook():
                     # Handle postback (button clicks)
                     if event.get("postback"):
                         payload = event["postback"].get("payload", "")
-                        handle_postback(sender_id, payload)
+                        handle_postback(sender_id, payload, page_token)
                     
                     # Handle regular messages
                     if event.get("message") and "text" in event["message"]:
@@ -91,7 +106,7 @@ def webhook():
                         
                         # Check for handoff request
                         if is_handoff_request(text):
-                            handle_handoff(sender_id, text)
+                            handle_handoff(sender_id, text, page_token)
                             continue
                         
                         # Extract and save lead info (phone/email)
@@ -126,7 +141,7 @@ def webhook():
                         save_message(sender_id, "assistant", reply_text)
                         
                         # Send reply
-                        send_message(sender_id, reply_text)
+                        send_message(sender_id, reply_text, page_token)
 
         return "EVENT_RECEIVED", 200
 
@@ -347,32 +362,32 @@ def is_handoff_request(text):
     return any(keyword in text_lower for keyword in keywords)
 
 
-def handle_handoff(sender_id, reason):
+def handle_handoff(sender_id, reason, page_token):
     """Handle handoff to human support"""
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         handoffs_sheet.append_row([sender_id, timestamp, reason, "pending", ""])
         
         # Send message with button
-        send_handoff_message(sender_id)
+        send_handoff_message(sender_id, page_token)
         
         print(f"Handoff requested by {sender_id}", flush=True)
     except Exception as e:
         print(f"Error handling handoff: {e}", flush=True)
 
 
-def handle_postback(sender_id, payload):
+def handle_postback(sender_id, payload, page_token):
     """Handle button clicks"""
     if payload == "CONNECT_HUMAN":
-        handle_handoff(sender_id, "Button: Connect to human")
+        handle_handoff(sender_id, "Button: Connect to human", page_token)
     elif payload == "CANCEL_HANDOFF":
-        send_message(sender_id, "No problem! I'm here to help. What can I assist you with?")
+        send_message(sender_id, "No problem! I'm here to help. What can I assist you with?", page_token)
 
 
-def send_handoff_message(sender_id):
+def send_handoff_message(sender_id, page_token):
     """Send message with handoff confirmation and button"""
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/me/messages"
-    params = {"access_token": PAGE_ACCESS_TOKEN}
+    params = {"access_token": page_token}
     
     payload = {
         "recipient": {"id": sender_id},
@@ -407,11 +422,35 @@ def get_ai_response(user_message, history, product_context, sender_id):
             for h in handoffs
         )
         
-        # Build system prompt
-        system_prompt = """You are a helpful sales assistant for our Facebook page. 
-Be friendly, concise, and helpful. Answer questions about products clearly.
-If someone wants to buy, ask for their phone number or email.
-Keep responses under 3 sentences unless detailed explanation is needed."""
+        # Build system prompt with new sales assistant role
+        system_prompt = """You are a professional sales assistant for an e-commerce business handling Facebook Messenger conversations.
+Your goal is to convert customer inquiries into confirmed orders using proven techniques from successful past conversations.
+
+Your Role:
+- Respond naturally in Sinhala and English based on customer's language or Singlish.
+- Be friendly, helpful, and persuasive without being pushy.
+- Dont send lengthy messages.
+
+Key Behaviors:
+1. Product Information: Provide clear details about price, features, availability, colors, sizes.
+2. Closing Questions: Ask "order karana kamathi dha?" or "do you want to place an order?" when appropriate.
+3. Handle Objections: Address concerns about price, delivery time, quality professionally.
+4. Confirm Orders: When customer says "ow" or "yes", confirm details (color, size, quantity, address).
+5. Payment Options: Mention COD (Cash on Delivery).
+
+Tone:
+- Conversational and warm.
+- Use casual Sinhala/Singlish like "ow", "එකයි", "කමතිද".
+- Match the customer's communication style.
+
+When Product Context is Available:
+Use the provided product details (name, price, description, image) to give accurate information.
+
+Never:
+- Make up product information not provided.
+- Promise delivery dates without confirmation.
+- Share personal opinions about products.
+- Be overly formal or robotic."""
         
         if product_context:
             system_prompt += f"\n\n{product_context}\n\nHelp customers with questions about these specific products."
@@ -437,13 +476,14 @@ Keep responses under 3 sentences unless detailed explanation is needed."""
         return "Sorry, I'm having trouble responding. Please try again or type 'talk to human' for support."
 
 
-def send_message(recipient_id, text):
+def send_message(recipient_id, text, page_token):
     """Send text message to user"""
-    if not PAGE_ACCESS_TOKEN:
+    if not page_token:
+        print("Missing PAGE token for this page", flush=True)
         return
     
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/me/messages"
-    params = {"access_token": PAGE_ACCESS_TOKEN}
+    params = {"access_token": page_token}
     payload = {
         "recipient": {"id": recipient_id},
         "message": {"text": text}
