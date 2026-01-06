@@ -37,20 +37,32 @@ if PAGE_ID_3 and PAGE_ACCESS_TOKEN_3:
 # Initialize OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# User conversation state tracking
+# User conversation state tracking (in-memory)
 user_states = {}
 
-# Initialize Google Sheets
+
+# =====================
+# Google Sheets helpers
+# =====================
+
 def get_sheet():
     try:
         creds_dict = json.loads(GOOGLE_SHEETS_CREDS)
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gc = gspread.authorize(creds)
         return gc.open(SHEET_NAME)
     except Exception as e:
         print(f"Google Sheets connection error: {e}", flush=True)
         return None
+
+
+# =========
+# Endpoints
+# =========
 
 @app.route("/", methods=["GET", "POST"])
 def health():
@@ -66,6 +78,7 @@ def health():
         return "Forbidden", 403
 
     return "OK", 200
+
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -106,30 +119,32 @@ def webhook():
 
         return "EVENT_RECEIVED", 200
 
+
+# ===================
+# Core flow handlers
+# ===================
+
 def handle_ad_referral(sender_id, ad_id, page_token):
     """Handle new user from Click-to-Messenger ad"""
     try:
-        # Save initial referral
         save_message(sender_id, ad_id, "system", f"User arrived from ad {ad_id}")
 
-        # Get products for this ad
         products_context, product_images = get_products_for_ad(ad_id)
 
-        # Send product details first
+        # Send product list
         if products_context:
             product_message = f"Mehenna ape products:\n\n{products_context}"
             send_message(sender_id, product_message, page_token)
             save_message(sender_id, ad_id, "assistant", product_message)
 
-        # Send ALL product images
+        # Send images (up to 10)
         if product_images:
             for img_url in product_images[:10]:
                 send_image(sender_id, img_url, page_token)
 
-        # Initialize conversation flow - Start with location question
+        # Start flow
         user_states[sender_id] = {"step": "ask_location", "ad_id": ad_id, "product": products_context}
 
-        # Ask for location
         location_msg = "Location eka kohada?\n\nDear 💙"
         send_message(sender_id, location_msg, page_token)
         save_message(sender_id, ad_id, "assistant", location_msg)
@@ -138,121 +153,120 @@ def handle_ad_referral(sender_id, ad_id, page_token):
     except Exception as e:
         print(f"Error in handle_ad_referral: {e}", flush=True)
 
-def handle_message(sender_id, text, page_token):
-    """Main message handler with FLEXIBLE flow"""
-    try:
-        # Get user's ad_id
-        ad_id = get_user_ad_id(sender_id)
 
-        # Save user message
+def handle_message(sender_id, text, page_token):
+    """Main message handler with flexible flow"""
+    try:
+        ad_id = get_user_ad_id(sender_id)
         save_message(sender_id, ad_id, "user", text)
 
-        # Detect language
         language = detect_language(text)
 
-        # CHECK IF USER WANTS TO PLACE ORDER DIRECTLY (skip flow)
+        # Direct order intent
         if detect_direct_order_intent(text):
             handle_direct_order(sender_id, text, page_token, ad_id)
             return
 
-        # Check if user is asking about delivery
+        # Delivery question
         is_delivery_question = detect_delivery_question(text)
-
-        # If asking about delivery, need location first
         if is_delivery_question and sender_id not in user_states:
-            # Start flow from location
             products_context, _ = get_products_for_ad(ad_id) if ad_id else (None, [])
-            user_states[sender_id] = {"step": "ask_location_for_delivery", "ad_id": ad_id, "product": products_context}
-
+            user_states[sender_id] = {
+                "step": "ask_location_for_delivery",
+                "ad_id": ad_id,
+                "product": products_context,
+            }
             location_msg = "Location eka kohada? Ekata delivery charge eka kiyanna puluwanda.\n\nDear 💙"
             send_message(sender_id, location_msg, page_token)
             save_message(sender_id, ad_id, "assistant", location_msg)
             return
 
-        # Check if user is asking a question (might want to pause flow)
         is_question = detect_question(text)
 
-        # Check if user is in a conversation flow
         if sender_id in user_states and not is_question:
             handle_conversation_flow(sender_id, text, page_token, language)
         else:
-            # If user asks question during flow, answer it but keep flow active
             if sender_id in user_states and is_question:
-                # Answer question without breaking flow
                 answer_question_in_flow(sender_id, text, page_token, language, ad_id)
             else:
-                # Regular conversation (organic user or after flow completed)
                 handle_regular_conversation(sender_id, text, page_token, language, ad_id)
 
     except Exception as e:
         print(f"Error in handle_message: {e}", flush=True)
         send_message(sender_id, "Sorry, I'm having trouble. Please try again. Dear 💙", page_token)
 
+
+# -------------
+# Intent detect
+# -------------
+
 def detect_direct_order_intent(text):
-    """Detect if user directly wants to place order"""
     direct_order_keywords = [
-        'order karanna', 'order karanawa', 'ganna', 'gannawa', 
-        'place order', 'i want to order', 'මං order කරන්න', 
-        'එක ගන්නම්', 'order karanna oni', 'දෙන්න', 'eka ganna'
+        "order karanna", "order karanawa", "ganna", "gannawa",
+        "place order", "i want to order", "මං order කරන්න",
+        "එක ගන්නම්", "order karanna oni", "දෙන්න", "eka ganna",
     ]
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in direct_order_keywords)
 
+
 def detect_delivery_question(text):
-    """Detect if user is asking about delivery"""
-    delivery_keywords = ['delivery', 'delivery kiyada', 'delivery charge', 'යවන්නේ', 
-                        'කොහොමද යවන්නේ', 'dawas', 'dawas kiyak', 'kiyak yanawada',
-                        'wenawada', 'days', 'කීයක්', 'delivery ekak']
+    delivery_keywords = [
+        "delivery", "delivery kiyada", "delivery charge", "යවන්නේ",
+        "කොහොමද යවන්නේ", "dawas", "dawas kiyak", "kiyak yanawada",
+        "wenawada", "days", "කීයක්", "delivery ekak",
+    ]
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in delivery_keywords)
 
+
 def detect_question(text):
-    """Detect if user is asking a question"""
-    question_indicators = ['?', 'thiyanawada', 'thiyenawada', 'mokakda', 'kohomada', 
-                          'kiyada', 'what', 'how', 'when', 'කොහොමද', 'මොකක්ද', 
-                          'තියෙනවද', 'කීයද', 'වර්ණ', 'color', 'size', 'wena',
-                          'monawada', 'mokada', 'kiyadha', 'total']
+    question_indicators = [
+        "?", "thiyanawada", "thiyenawada", "mokakda", "kohomada",
+        "kiyada", "what", "how", "when", "කොහොමද", "මොකක්ද",
+        "තියෙනවද", "කීයද", "වර්ණ", "color", "size", "wena",
+        "monawada", "mokada", "kiyadha", "total", "mona",
+    ]
     text_lower = text.lower()
-    # Don't treat delivery questions as regular questions during details collection
     if detect_delivery_question(text):
         return False
-    return '?' in text or any(indicator in text_lower for indicator in question_indicators)
+    return "?" in text or any(indicator in text_lower for indicator in question_indicators)
+
+
+# ---------------
+# Flow functions
+# ---------------
 
 def handle_direct_order(sender_id, text, page_token, ad_id):
-    """Handle when user directly says they want to order"""
-    # Skip flow, go straight to collecting details
     products_context, _ = get_products_for_ad(ad_id) if ad_id else (None, [])
-
     user_states[sender_id] = {
-        "step": "collect_details_direct", 
-        "ad_id": ad_id, 
-        "product": products_context
+        "step": "collect_details_direct",
+        "ad_id": ad_id,
+        "product": products_context,
     }
-
-    # Ask for all details
-    details_msg = "Super! Meh details ewanna puluwanda:\n\n1. Name\n2. Address (full address)\n3. Phone number\n4. Quantity (keeyek onda?)\n\nDear 💙"
+    details_msg = (
+        "Super! Meh details ewanna puluwanda:\n\n"
+        "1. Name\n"
+        "2. Address (full address)\n"
+        "3. Phone number\n"
+        "4. Quantity (keeyek onda?)\n\nDear 💙"
+    )
     send_message(sender_id, details_msg, page_token)
     save_message(sender_id, ad_id, "assistant", details_msg)
 
+
 def answer_question_in_flow(sender_id, text, page_token, language, ad_id):
-    """Answer user's question while maintaining flow state"""
     state = user_states[sender_id]
     products_context = state.get("product")
-
-    # Get conversation history
     history = get_conversation_history(sender_id, limit=8)
-
-    # Generate answer using AI
     reply = get_ai_response(text, history, products_context, language)
 
-    # Send answer
     send_message(sender_id, reply, page_token)
     save_message(sender_id, ad_id, "assistant", reply)
 
-    # ONLY continue flow if not in details collection step
     step = state.get("step")
     if step not in ["collect_details", "collect_details_direct"]:
-        if step == "ask_location" or step == "ask_location_for_delivery":
+        if step in ["ask_location", "ask_location_for_delivery"]:
             follow_up = "Location eka kohada? 😊\n\nDear 💙"
         elif step == "confirm_delivery":
             follow_up = "Delivery charge Rs.350 ok neda?\n\nDear 💙"
@@ -260,80 +274,70 @@ def answer_question_in_flow(sender_id, text, page_token, language, ad_id):
             follow_up = "Order karanna kamathi dha?\n\nDear 💙"
         else:
             return
-
         send_message(sender_id, follow_up, page_token)
         save_message(sender_id, ad_id, "assistant", follow_up)
 
+
 def handle_conversation_flow(sender_id, text, page_token, language):
-    """Handle step-by-step conversation flow"""
     state = user_states[sender_id]
     step = state.get("step")
     ad_id = state.get("ad_id")
 
-    if step == "ask_location" or step == "ask_location_for_delivery":
-        # User provided location
+    if step in ["ask_location", "ask_location_for_delivery"]:
         state["location"] = text
         state["step"] = "confirm_delivery"
 
-        # Tell delivery charge AND ask for order
         delivery_msg = "Hari! Delivery charge eka Rs.350 yi. Eka ok neda?\n\nDear 💙"
         send_message(sender_id, delivery_msg, page_token)
         save_message(sender_id, ad_id, "assistant", delivery_msg)
 
     elif step == "confirm_delivery":
-        # Check if user agrees
         agrees = check_agreement(text)
 
         if agrees:
             state["step"] = "ask_order"
-
-            # Ask if they want to order
             order_msg = "Order karanna kamathi dha?\n\nDear 💙"
             send_message(sender_id, order_msg, page_token)
             save_message(sender_id, ad_id, "assistant", order_msg)
         else:
-            # Not interested, end flow
             goodbye_msg = "Hari dear, awashya welawaka mata call karanna!\n\nDear 💙"
             send_message(sender_id, goodbye_msg, page_token)
             save_message(sender_id, ad_id, "assistant", goodbye_msg)
             del user_states[sender_id]
 
     elif step == "ask_order":
-        # Check if user wants to order
         wants_order = check_agreement(text)
 
         if wants_order:
             state["step"] = "collect_details"
-
-            # Ask for all details
-            details_msg = "Super! Meh details ewanna puluwanda:\n\n1. Name\n2. Address (full address)\n3. Phone number\n4. Quantity (keeyek onda?)\n\nDear 💙"
+            details_msg = (
+                "Super! Meh details ewanna puluwanda:\n\n"
+                "1. Name\n"
+                "2. Address (full address)\n"
+                "3. Phone number\n"
+                "4. Quantity (keeyek onda?)\n\nDear 💙"
+            )
             send_message(sender_id, details_msg, page_token)
             save_message(sender_id, ad_id, "assistant", details_msg)
         else:
-            # Not ordering, end flow
             goodbye_msg = "Hari dear, prashna thiyenawannam ahanna!\n\nDear 💙"
             send_message(sender_id, goodbye_msg, page_token)
             save_message(sender_id, ad_id, "assistant", goodbye_msg)
             del user_states[sender_id]
 
-    elif step == "collect_details" or step == "collect_details_direct":
-        # Extract all details from message
+    elif step in ["collect_details", "collect_details_direct"]:
         lead_info = extract_full_lead_info(text)
 
-        # Need at least name AND phone
         if lead_info.get("phone") and lead_info.get("name"):
-            # Save to Leads with product
             save_complete_order(sender_id, ad_id, lead_info, state.get("product"))
-
-            # Confirm order
-            confirm_msg = f"Order eka confirm! {lead_info.get('phone')} ekata call karala delivery arrange karanawa. Thank you!\n\nDear 💙"
+            confirm_msg = (
+                f"Order eka confirm! {lead_info.get('phone')} ekata call karala delivery arrange karanawa. "
+                "Thank you!\n\nDear 💙"
+            )
             send_message(sender_id, confirm_msg, page_token)
             save_message(sender_id, ad_id, "assistant", confirm_msg)
-
-            # End flow
             del user_states[sender_id]
         else:
-            # Missing details, ask again
             missing = []
             if not lead_info.get("name"):
                 missing.append("Name")
@@ -344,134 +348,137 @@ def handle_conversation_flow(sender_id, text, page_token, language):
             if not lead_info.get("quantity"):
                 missing.append("Quantity")
 
-            retry_msg = f"{', '.join(missing)} missing. Karuna karala full details ewanna:\n\nName\nAddress\nPhone\nQuantity\n\nDear 💙"
+            retry_msg = (
+                f"{', '.join(missing)} missing. Karuna karala full details ewanna:\n\n"
+                "Name\nAddress\nPhone\nQuantity\n\nDear 💙"
+            )
             send_message(sender_id, retry_msg, page_token)
             save_message(sender_id, ad_id, "assistant", retry_msg)
 
-def handle_regular_conversation(sender_id, text, page_token, language, ad_id):
-    """Handle regular conversations (non-flow)"""
-    # Check if user wants photos
-    wants_photos = detect_photo_request(text)
 
-    # Get conversation history
+def handle_regular_conversation(sender_id, text, page_token, language, ad_id):
+    wants_photos = detect_photo_request(text)
     history = get_conversation_history(sender_id, limit=10)
 
-    # Get products
     products_context = None
     product_images = []
 
     if ad_id:
         products_context, product_images = get_products_for_ad(ad_id)
     else:
-        # For organic users, search products
         products_context, product_images = search_products_by_query(text)
 
-        # If found products, send details and images
         if products_context:
             product_msg = f"Mehenna ape products:\n\n{products_context}"
             send_message(sender_id, product_msg, page_token)
             save_message(sender_id, ad_id, "assistant", product_msg)
 
-            # Send ALL images
             if product_images:
                 for img_url in product_images[:10]:
                     send_image(sender_id, img_url, page_token)
 
-            # Start conversation flow
             user_states[sender_id] = {"step": "ask_location", "ad_id": ad_id, "product": products_context}
-
             location_msg = "Location eka kohada?\n\nDear 💙"
             send_message(sender_id, location_msg, page_token)
             save_message(sender_id, ad_id, "assistant", location_msg)
             return
 
-    # If user wants photos, send them
     if wants_photos and product_images:
         for img_url in product_images[:10]:
             send_image(sender_id, img_url, page_token)
         reply_text = "Mehenna photos! Order karanna kamathi dha?\n\nDear 💙"
     else:
-        # Generate AI response
         reply_text = get_ai_response(text, history, products_context, language)
 
-    # Save and send
     save_message(sender_id, ad_id, "assistant", reply_text)
     send_message(sender_id, reply_text, page_token)
 
+
+# ===============
+# NLP helpers
+# ===============
+
 def check_agreement(text):
-    """Check if user agrees/says yes"""
-    agreement_keywords = ['yes', 'ow', 'හරි', 'ඔව්', 'ok', 'oka', 'එහෙනම්', 'ඕනා', 'කැමති', 'kamathi', 'hari']
+    agreement_keywords = [
+        "yes", "ow", "හරි", "ඔව්", "ok", "oka", "එහෙනම්",
+        "ඕනා", "කැමති", "kamathi", "hari",
+    ]
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in agreement_keywords)
 
+
 def extract_full_lead_info(text):
-    """Extract name, address, phone, quantity from detailed message"""
     info = {}
 
-    # Extract phone
+    # phone
     phone_patterns = [
-        r'(0\d{9})',
-        r'(\+94\d{9})',
-        r'(94\d{9})'
+        r"(0\d{9})",
+        r"(\+94\d{9})",
+        r"(94\d{9})",
     ]
     for pattern in phone_patterns:
-        match = re.search(pattern, text.replace(' ', '').replace('-', ''))
+        match = re.search(pattern, text.replace(" ", "").replace("-", ""))
         if match:
-            info['phone'] = match.group(1)
+            info["phone"] = match.group(1)
             break
 
-    # Extract quantity
+    # quantity
     qty_patterns = [
-        r'(?:qty|quantity|කීයක්|ප්‍රමාණය|keeyek)[:\s]*(\d+)',
-        r'(\d+)\s*(?:ක්|එකක්|න්|ekak|ganna|layer|tier)',
-        r'\n(\d+)\s*$',
-        r'^(\d+)$',
-        r'\s(\d+)\s*(?:\n|$)'
+        r"(?:qty|quantity|කීයක්|ප්‍රමාණය|keeyek)[:\s]*(\d+)",
+        r"(\d+)\s*(?:ක්|එකක්|න්|ekak|ganna|layer|tier)",
+        r"\n(\d+)\s*$",
+        r"^(\d+)$",
+        r"\s(\d+)\s*(?:\n|$)",
     ]
     for pattern in qty_patterns:
         match = re.search(pattern, text.lower())
         if match:
-            info['quantity'] = match.group(1)
+            info["quantity"] = match.group(1)
             break
 
-    if not info.get('quantity'):
-        single_num = re.search(r'(?:^|\s)(\d+)(?:\s|$)', text)
+    if not info.get("quantity"):
+        single_num = re.search(r"(?:^|\s)(\d+)(?:\s|$)", text)
         if single_num:
-            info['quantity'] = single_num.group(1)
+            info["quantity"] = single_num.group(1)
 
-    # Extract name
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    # name
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
     for i, line in enumerate(lines):
-        if any(word in line.lower() for word in ['name', 'නම', 'nama']):
-            name_match = re.search(r'(?:name|නම|nama)[:\s]*([A-Z][a-zA-Z\s]{1,40})', line, re.IGNORECASE)
+        if any(word in line.lower() for word in ["name", "නම", "nama"]):
+            name_match = re.search(r"(?:name|නම|nama)[:\s]*([A-Z][a-zA-Z\s]{1,40})", line, re.IGNORECASE)
             if name_match:
-                info['name'] = name_match.group(1).strip()
+                info["name"] = name_match.group(1).strip()
                 break
-        elif i == 0 and re.match(r'^[A-Z][a-z]+', line):
-            info['name'] = line[:50]
+        elif i == 0 and re.match(r"^[A-Z][a-z]+", line):
+            info["name"] = line[:50]
             break
-        elif re.match(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$', line):
-            info['name'] = line[:50]
+        elif re.match(r"^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$", line):
+            info["name"] = line[:50]
             break
 
-    # Extract address
+    # address
     address_lines = []
     for i, line in enumerate(lines):
-        if any(indicator in line.lower() for indicator in ['no:', 'no.', 'road', 'street', 'galle', 
-                                                           'colombo', 'kandy', 'kurunegala', 'negombo',
-                                                           'address', 'ලිපිනය']):
+        if any(
+            indicator in line.lower()
+            for indicator in [
+                "no:", "no.", "road", "street", "galle",
+                "colombo", "kandy", "kurunegala", "negombo",
+                "address", "ලිපිනය",
+            ]
+        ):
             address_lines.append(line)
-        elif i == 1 and not re.search(r'\d{9,10}', line.replace(' ', '')) and len(line) > 5:
-            if not re.match(r'^\d+$', line):
+        elif i == 1 and not re.search(r"\d{9,10}", line.replace(" ", "")) and len(line) > 5:
+            if not re.match(r"^\d+$", line):
                 address_lines.append(line)
 
     if address_lines:
-        info['address'] = ' '.join(address_lines)[:200]
+        info["address"] = " ".join(address_lines)[:200]
 
     return info
 
+
 def save_complete_order(sender_id, ad_id, lead_info, products_context):
-    """Save complete order to Leads sheet"""
     try:
         sheet = get_sheet()
         if not sheet:
@@ -479,44 +486,43 @@ def save_complete_order(sender_id, ad_id, lead_info, products_context):
 
         leads_sheet = sheet.worksheet("Leads")
 
-        # Extract product name from products_context
         product_name = "Order Placed"
         if products_context:
-            lines = products_context.split('\n')
+            lines = products_context.split("\n")
             for line in lines:
-                if line.strip() and ' - ' in line:
-                    product_name = line.strip().split(' - ')[0][:50]
+                if line.strip() and " - " in line:
+                    product_name = line.strip().split(" - ")[0][:50]
                     break
 
-        # Add quantity to product name
-        if lead_info.get('quantity'):
+        if lead_info.get("quantity"):
             product_name = f"{product_name} (Qty: {lead_info['quantity']})"
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Save new order
-        leads_sheet.append_row([
-            sender_id,
-            ad_id or "",
-            lead_info.get('name', ''),
-            lead_info.get('address', ''),
-            lead_info.get('phone', ''),
-            product_name,
-            timestamp,
-            "ordered"
-        ])
+        leads_sheet.append_row(
+            [
+                sender_id,
+                ad_id or "",
+                lead_info.get("name", ""),
+                lead_info.get("address", ""),
+                lead_info.get("phone", ""),
+                product_name,
+                timestamp,
+                "ordered",
+            ]
+        )
 
         print(f"Saved complete order: {lead_info}", flush=True)
 
     except Exception as e:
         print(f"Error saving order: {e}", flush=True)
 
+
 def detect_language(text):
-    """Detect if user is speaking Sinhala, English, or Singlish"""
-    sinhala_pattern = re.compile('[\u0D80-\u0DFF]')
+    sinhala_pattern = re.compile("[\u0D80-\u0DFF]")
     has_sinhala = bool(sinhala_pattern.search(text))
 
-    english_words = re.findall(r'\b[a-zA-Z]+\b', text)
+    english_words = re.findall(r"\b[a-zA-Z]+\b", text)
     has_english = len(english_words) > 0
 
     if has_sinhala and has_english:
@@ -526,44 +532,54 @@ def detect_language(text):
     else:
         return "english"
 
+
 def detect_photo_request(text):
-    """Detect if user wants to see photos"""
-    photo_keywords = ['photo', 'photos', 'pic', 'pics', 'picture', 'image', 
-                      'wena', 'පින්තූර', 'photo එක', 'pics දෙන්න', 'photo danna']
+    photo_keywords = [
+        "photo", "photos", "pic", "pics", "picture", "image",
+        "wena", "පින්තූර", "photo එක", "pics දෙන්න", "photo danna",
+    ]
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in photo_keywords)
 
+
+# =========================
+# AI response + products
+# =========================
+
 def get_ai_response(user_message, history, products_context, language):
-    """Generate AI response - SHORT, NATURAL casual Singlish"""
+    """Generate AI response - short, natural Singlish, handle 'mona products' properly"""
     try:
-        # STRICT system prompt - ONLY talk about products in the sheet
-        system_prompt = """You are a friendly sales assistant. Respond in CASUAL SINGLISH.
+        # When NO products at all for this conversation
+        if not products_context:
+            system_prompt = """
+You are a friendly sales assistant. Respond in CASUAL SINGLISH.
+
+No products list is available for this conversation.
+
+Rules:
+1. If user asks "mona products" / "mona products dha thiyanai", tell them politely that product list is not available now.
+2. Example first reply: "Product list eka denna ba dear, awashya welawaka contact karanna."
+3. If they ask again, change the wording. DON'T repeat the exact same sentence.
+4. For other questions, answer briefly and friendly.
+5. Very short (1–2 sentences), end every message with "Dear 💙".
+"""
+        else:
+            # Normal mode with products
+            system_prompt = """
+You are a friendly sales assistant. Respond in CASUAL SINGLISH.
 
 CRITICAL RULES:
-1. ONLY mention products that are in the Products list below
-2. If asked about a product NOT in the list, say "Eka nehe dear, mehenna products witharak thiyanawa"
-3. Very short (1-2 sentences max)
-4. Natural Singlish: "ow", "thiyanawa", "kiyada", "mehenna", "kamathi dha"
-5. End with "Dear 💙"
-6. ALWAYS use EXACT prices from Products list
-7. Delivery: Rs.350, 3-5 working days
-8. For delivery time questions: "3-5 working days yanawa dear"
-
-Examples:
-- "Ow dear, thiyanawa. Rs.14,500 yi."
-- "Mehenna rack eka. Order karanna kamathi dha?"
-- "Delivery 3-5 working days yanawa dear."
-- "Eka nehe dear, mehenna products witharak thiyanawa."
-
-DO NOT:
-- Mention products not in the list
-- Make up prices
-- Promise products you don't have"""
-
-        if products_context:
-            system_prompt += f"\n\nProducts (ONLY these exist):\n{products_context}"
-        else:
-            system_prompt += "\n\nNo products available for this conversation."
+1. ONLY mention products that are in the Products list below.
+2. If user asks "mona products dha thiyanai" or "mona products", that means "What products do you have?" → list the products from the Products list.
+3. If user asks about a product NOT in the list, say once: "Eka nehe dear", then suggest what you have.
+4. Very short (1–2 sentences max).
+5. Natural Singlish: "ow", "thiyanawa", "kiyada", "mehenna", "kamathi dha".
+6. ALWAYS use EXACT prices from Products list.
+7. Delivery: Rs.350, 3–5 working days.
+8. Try NOT to repeat the exact same sentence if user asks again.
+9. End every message with "Dear 💙".
+"""
+            system_prompt += f"\nProducts (ONLY these exist):\n{products_context}"
 
         messages = [{"role": "system", "content": system_prompt}]
 
@@ -576,7 +592,7 @@ DO NOT:
             model="gpt-4o-mini",
             messages=messages,
             max_tokens=80,
-            temperature=0.7
+            temperature=0.8,  # a bit higher for variety
         )
 
         reply = response.choices[0].message.content.strip()
@@ -590,8 +606,9 @@ DO NOT:
         print(f"OpenAI error: {e}", flush=True)
         return "Sorry, having trouble. Dear 💙"
 
+
 def get_products_for_ad(ad_id):
-    """Get products from Google Sheets for specific ad_id - ALL IMAGES"""
+    """Get products + all images for a given ad_id from sheet"""
     try:
         sheet = get_sheet()
         if not sheet:
@@ -605,7 +622,6 @@ def get_products_for_ad(ad_id):
                 products_text = ""
                 image_urls = []
 
-                # Get all products (up to 5)
                 for i in range(1, 6):
                     name_key = f"product_{i}_name"
                     price_key = f"product_{i}_price"
@@ -613,7 +629,6 @@ def get_products_for_ad(ad_id):
                     if row.get(name_key):
                         products_text += f"{row[name_key]} - {row.get(price_key, '')}\n"
 
-                        # Get ALL 3 images for each product
                         for img_num in range(1, 4):
                             image_key = f"product_{i}_image_{img_num}"
                             if row.get(image_key):
@@ -629,8 +644,8 @@ def get_products_for_ad(ad_id):
         print(f"Error getting products: {e}", flush=True)
         return None, []
 
+
 def send_image(recipient_id, image_url, page_token):
-    """Send an image via Messenger"""
     if not page_token:
         return
 
@@ -643,25 +658,26 @@ def send_image(recipient_id, image_url, page_token):
                 "type": "image",
                 "payload": {
                     "url": image_url,
-                    "is_reusable": True
-                }
+                    "is_reusable": True,
+                },
             }
-        }
+        },
     }
 
     r = requests.post(url, params=params, json=payload)
     print(f"Send image: {r.status_code}", flush=True)
 
+
 def search_products_by_query(query):
-    """AI-powered product search"""
+    """Search products in sheet using AI-extracted keywords"""
     try:
         keyword_response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "Extract product keywords. Return only keywords, comma separated."},
-                {"role": "user", "content": query}
+                {"role": "user", "content": query},
             ],
-            max_tokens=30
+            max_tokens=30,
         )
 
         keywords = keyword_response.choices[0].message.content.lower()
@@ -684,10 +700,9 @@ def search_products_by_query(query):
                     prod_name = row.get(f"product_{i}_name")
                     prod_price = row.get(f"product_{i}_price")
 
-                    if prod_name and prod_name not in [p['name'] for p in found_products]:
+                    if prod_name and prod_name not in [p["name"] for p in found_products]:
                         found_products.append({"name": prod_name, "price": prod_price})
 
-                        # Get all 3 images
                         for img_num in range(1, 4):
                             img_url = row.get(f"product_{i}_image_{img_num}")
                             if img_url and img_url.startswith("http"):
@@ -706,8 +721,12 @@ def search_products_by_query(query):
         print(f"Error in search: {e}", flush=True)
         return None, []
 
+
+# ====================
+# Conversation logging
+# ====================
+
 def save_message(sender_id, ad_id, role, message):
-    """Save message to Conversations"""
     try:
         sheet = get_sheet()
         if not sheet:
@@ -716,19 +735,21 @@ def save_message(sender_id, ad_id, role, message):
         conversations_sheet = sheet.worksheet("Conversations")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        conversations_sheet.append_row([
-            sender_id,
-            ad_id or "",
-            timestamp,
-            role,
-            message
-        ])
+        conversations_sheet.append_row(
+            [
+                sender_id,
+                ad_id or "",
+                timestamp,
+                role,
+                message,
+            ]
+        )
 
     except Exception as e:
         print(f"Error saving message: {e}", flush=True)
 
+
 def get_conversation_history(sender_id, limit=10):
-    """Get conversation history"""
     try:
         sheet = get_sheet()
         if not sheet:
@@ -740,14 +761,18 @@ def get_conversation_history(sender_id, limit=10):
         user_messages = [r for r in records if str(r.get("sender_id")) == str(sender_id)]
         user_messages = user_messages[-limit:]
 
-        return [{"role": m["role"], "message": m["message"]} for m in user_messages if m["role"] in ["user", "assistant"]]
+        return [
+            {"role": m["role"], "message": m["message"]}
+            for m in user_messages
+            if m["role"] in ["user", "assistant"]
+        ]
 
     except Exception as e:
         print(f"Error getting history: {e}", flush=True)
         return []
 
+
 def get_user_ad_id(sender_id):
-    """Get ad_id for this user"""
     try:
         sheet = get_sheet()
         if not sheet:
@@ -768,8 +793,8 @@ def get_user_ad_id(sender_id):
         print(f"Error getting ad_id: {e}", flush=True)
         return None
 
+
 def send_message(recipient_id, text, page_token):
-    """Send text message"""
     if not page_token:
         return
 
@@ -777,11 +802,12 @@ def send_message(recipient_id, text, page_token):
     params = {"access_token": page_token}
     payload = {
         "recipient": {"id": recipient_id},
-        "message": {"text": text}
+        "message": {"text": text},
     }
 
     r = requests.post(url, params=params, json=payload)
     print(f"Send message: {r.status_code}", flush=True)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
