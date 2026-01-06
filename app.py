@@ -121,9 +121,9 @@ def handle_ad_referral(sender_id, ad_id, page_token):
             send_message(sender_id, product_message, page_token)
             save_message(sender_id, ad_id, "assistant", product_message)
 
-        # Send ALL product images (up to 3 images per product)
+        # Send ALL product images
         if product_images:
-            for img_url in product_images[:10]:  # Send up to 10 images
+            for img_url in product_images[:10]:
                 send_image(sender_id, img_url, page_token)
 
         # Initialize conversation flow - Start with location question
@@ -201,7 +201,8 @@ def detect_direct_order_intent(text):
 def detect_delivery_question(text):
     """Detect if user is asking about delivery"""
     delivery_keywords = ['delivery', 'delivery kiyada', 'delivery charge', 'යවන්නේ', 
-                        'කොහොමද යවන්නේ', 'dawas', 'dawas kiyak', 'kiyak yanawada']
+                        'කොහොමද යවන්නේ', 'dawas', 'dawas kiyak', 'kiyak yanawada',
+                        'wenawada', 'days', 'කීයක්', 'delivery ekak']
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in delivery_keywords)
 
@@ -210,7 +211,7 @@ def detect_question(text):
     question_indicators = ['?', 'thiyanawada', 'thiyenawada', 'mokakda', 'kohomada', 
                           'kiyada', 'what', 'how', 'when', 'කොහොමද', 'මොකක්ද', 
                           'තියෙනවද', 'කීයද', 'වර්ණ', 'color', 'size', 'wena',
-                          'monawada', 'mokada']
+                          'monawada', 'mokada', 'kiyadha', 'total']
     text_lower = text.lower()
     # Don't treat delivery questions as regular questions during details collection
     if detect_delivery_question(text):
@@ -251,7 +252,7 @@ def answer_question_in_flow(sender_id, text, page_token, language, ad_id):
     # ONLY continue flow if not in details collection step
     step = state.get("step")
     if step not in ["collect_details", "collect_details_direct"]:
-        if step == "ask_location":
+        if step == "ask_location" or step == "ask_location_for_delivery":
             follow_up = "Location eka kohada? 😊\n\nDear 💙"
         elif step == "confirm_delivery":
             follow_up = "Delivery charge Rs.350 ok neda?\n\nDear 💙"
@@ -274,7 +275,7 @@ def handle_conversation_flow(sender_id, text, page_token, language):
         state["location"] = text
         state["step"] = "confirm_delivery"
 
-        # Tell delivery charge
+        # Tell delivery charge AND ask for order
         delivery_msg = "Hari! Delivery charge eka Rs.350 yi. Eka ok neda?\n\nDear 💙"
         send_message(sender_id, delivery_msg, page_token)
         save_message(sender_id, ad_id, "assistant", delivery_msg)
@@ -419,13 +420,13 @@ def extract_full_lead_info(text):
             info['phone'] = match.group(1)
             break
 
-    # Extract quantity - improve to capture "1" alone
+    # Extract quantity
     qty_patterns = [
         r'(?:qty|quantity|කීයක්|ප්‍රමාණය|keeyek)[:\s]*(\d+)',
         r'(\d+)\s*(?:ක්|එකක්|න්|ekak|ganna|layer|tier)',
-        r'\n(\d+)\s*$',  # Number at end of line
-        r'^(\d+)$',  # Just a number
-        r'\s(\d+)\s*(?:\n|$)'  # Number with newline
+        r'\n(\d+)\s*$',
+        r'^(\d+)$',
+        r'\s(\d+)\s*(?:\n|$)'
     ]
     for pattern in qty_patterns:
         match = re.search(pattern, text.lower())
@@ -433,13 +434,12 @@ def extract_full_lead_info(text):
             info['quantity'] = match.group(1)
             break
 
-    # If no quantity found but there's a single digit number, use it
     if not info.get('quantity'):
         single_num = re.search(r'(?:^|\s)(\d+)(?:\s|$)', text)
         if single_num:
             info['quantity'] = single_num.group(1)
 
-    # Extract name - improved to get first line or capitalized words
+    # Extract name
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     for i, line in enumerate(lines):
         if any(word in line.lower() for word in ['name', 'නම', 'nama']):
@@ -447,23 +447,20 @@ def extract_full_lead_info(text):
             if name_match:
                 info['name'] = name_match.group(1).strip()
                 break
-        # First line with capitalized word (likely name)
         elif i == 0 and re.match(r'^[A-Z][a-z]+', line):
             info['name'] = line[:50]
             break
-        # Line with just capitalized words
         elif re.match(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$', line):
             info['name'] = line[:50]
             break
 
-    # Extract address - second/third line or lines with location indicators
+    # Extract address
     address_lines = []
     for i, line in enumerate(lines):
         if any(indicator in line.lower() for indicator in ['no:', 'no.', 'road', 'street', 'galle', 
                                                            'colombo', 'kandy', 'kurunegala', 'negombo',
                                                            'address', 'ලිපිනය']):
             address_lines.append(line)
-        # Second line is often address (if not phone or qty)
         elif i == 1 and not re.search(r'\d{9,10}', line.replace(' ', '')) and len(line) > 5:
             if not re.match(r'^\d+$', line):
                 address_lines.append(line)
@@ -482,7 +479,7 @@ def save_complete_order(sender_id, ad_id, lead_info, products_context):
 
         leads_sheet = sheet.worksheet("Leads")
 
-        # Extract product name - improved to capture "4 layer rack" etc
+        # Extract product name from products_context
         product_name = "Order Placed"
         if products_context:
             lines = products_context.split('\n')
@@ -539,29 +536,34 @@ def detect_photo_request(text):
 def get_ai_response(user_message, history, products_context, language):
     """Generate AI response - SHORT, NATURAL casual Singlish"""
     try:
-        # CASUAL SINGLISH system prompt
+        # STRICT system prompt - ONLY talk about products in the sheet
         system_prompt = """You are a friendly sales assistant. Respond in CASUAL SINGLISH.
 
-Rules:
-1. Very short (1-2 sentences max)
-2. Natural Singlish: "ow", "thiyanawa", "kiyada", "mehenna", "kamathi dha", "harida"
-3. Remember conversation context
-4. Only mention products that exist
+CRITICAL RULES:
+1. ONLY mention products that are in the Products list below
+2. If asked about a product NOT in the list, say "Eka nehe dear, mehenna products witharak thiyanawa"
+3. Very short (1-2 sentences max)
+4. Natural Singlish: "ow", "thiyanawa", "kiyada", "mehenna", "kamathi dha"
 5. End with "Dear 💙"
-6. "Mona" means "what" in Sinhala - ask which product they want
-7. Layer/tier racks - always say "4 layer rack", "3 layer rack" etc
+6. ALWAYS use EXACT prices from Products list
+7. Delivery: Rs.350, 3-5 working days
+8. For delivery time questions: "3-5 working days yanawa dear"
 
 Examples:
-- "Ow dear, thiyanawa. Rs.5000 yi."
+- "Ow dear, thiyanawa. Rs.14,500 yi."
 - "Mehenna rack eka. Order karanna kamathi dha?"
-- "Blue, Red colors thiyanawa dear."
-- "Location eka kohada?"
-- "Delivery 3-5 days yanawa dear."
+- "Delivery 3-5 working days yanawa dear."
+- "Eka nehe dear, mehenna products witharak thiyanawa."
 
-Delivery: Rs.350 fixed, 3-5 working days, COD available"""
+DO NOT:
+- Mention products not in the list
+- Make up prices
+- Promise products you don't have"""
 
         if products_context:
-            system_prompt += f"\n\nProducts:\n{products_context}"
+            system_prompt += f"\n\nProducts (ONLY these exist):\n{products_context}"
+        else:
+            system_prompt += "\n\nNo products available for this conversation."
 
         messages = [{"role": "system", "content": system_prompt}]
 
