@@ -109,12 +109,8 @@ def handle_ad_referral(sender_id, ad_id, page_token):
         # Save initial referral
         save_message(sender_id, ad_id, "system", f"User arrived from ad {ad_id}")
 
-        # Get products for this ad
-        products = get_products_for_ad(ad_id)
-
-        if products:
-            # Send product images at start of conversation
-            send_product_images(sender_id, ad_id, page_token)
+        # Send product images at start
+        send_product_images_for_ad(sender_id, ad_id, page_token)
 
         print(f"Ad referral: sender={sender_id}, ad_id={ad_id}", flush=True)
     except Exception as e:
@@ -129,7 +125,10 @@ def handle_message(sender_id, text, page_token):
         # Save user message
         save_message(sender_id, ad_id, "user", text)
 
-        # Check for order placement (before lead extraction)
+        # Detect language preference
+        language = detect_language(text)
+
+        # Check for order placement
         order_detected = detect_order_placement(text)
 
         # Extract lead info (phone, address, name)
@@ -137,17 +136,23 @@ def handle_message(sender_id, text, page_token):
         if lead_info:
             save_lead(sender_id, ad_id, lead_info)
 
-        # Detect language preference
-        language = detect_language(text)
-
         # Get conversation history
         history = get_conversation_history(sender_id)
 
-        # Get products
+        # Get products and send images if found
+        products_context = None
+        product_images = []
+
         if ad_id:
-            products_context = get_products_for_ad(ad_id)
+            products_context, product_images = get_products_for_ad(ad_id)
         else:
-            products_context = search_products_by_query(text)
+            # For organic users, search products and send images
+            products_context, product_images = search_products_by_query(text)
+
+        # Send product images if found (for organic conversations)
+        if product_images and not ad_id:
+            for img_url in product_images[:3]:  # Send max 3 images
+                send_image(sender_id, img_url, page_token)
 
         # Generate AI response
         reply_text = get_ai_response(text, history, products_context, language, order_detected, lead_info)
@@ -198,9 +203,9 @@ def extract_lead_info(text):
 
     # Extract Sri Lankan phone numbers
     phone_patterns = [
-        r'\b(0\d{9})\b',  # 0771234567
-        r'\b(\+94\d{9})\b',  # +94771234567
-        r'\b(94\d{9})\b'  # 94771234567
+        r'\b(0\d{9})\b',
+        r'\b(\+94\d{9})\b',
+        r'\b(94\d{9})\b'
     ]
     for pattern in phone_patterns:
         match = re.search(pattern, text)
@@ -208,18 +213,17 @@ def extract_lead_info(text):
             info['phone'] = match.group(1)
             break
 
-    # Extract address (look for common address keywords)
+    # Extract address
     address_keywords = ['address', 'ලිපිනය', 'delivery', 'යවන්න', 'එවන්න']
     if any(keyword in text.lower() for keyword in address_keywords):
-        # Simple extraction: take the text after address keyword
         for keyword in address_keywords:
             if keyword in text.lower():
                 parts = text.lower().split(keyword)
                 if len(parts) > 1:
-                    info['address'] = parts[1].strip()[:200]  # Limit length
+                    info['address'] = parts[1].strip()[:200]
                     break
 
-    # Extract name (look for "name is" or "නම" patterns)
+    # Extract name
     name_patterns = [
         r'name is ([A-Za-z\s]+)',
         r'මගේ නම ([^\n]+)',
@@ -234,111 +238,150 @@ def extract_lead_info(text):
     return info if info else None
 
 def get_ai_response(user_message, history, products_context, language, order_detected, lead_info):
-    """Generate AI response - SHORT AND CONCISE messages in Sinhala"""
+    """Generate AI response - MATCH USER'S LANGUAGE and be natural/humanized"""
     try:
-        # Build system prompt - UPDATED FOR SHORT RESPONSES IN SINHALA
-        if language == "sinhala" or language == "singlish":
-            system_prompt = """ඔබ විශිෂ්ට විකුණුම් සහායකයෙක්. ඔබේ භූමිකාව:
+        # CRITICAL: Match user's language exactly
+        if language == "sinhala":
+            system_prompt = """ඔබ මිත්‍රශීලී විකුණුම් සහායකයෙක්.
 
-1. කෙටි හා ප්‍රයෝජනවත් පණිවිඩ යවන්න (2-4 වාක්‍ය පමණ)
-2. නිෂ්පාදන ගැන ප්‍රධාන තොරතුරු දෙන්න - මිල, ප්‍රධාන විශේෂාංග
-3. මිත්‍රශීලී හා උණුසුම් ලෙස කතා කරන්න
-4. සෑම පණිවිඩයක්ම "Dear 💙" සමග අවසන් කරන්න
+ප්‍රධාන නීති:
+1. පරිශීලකයා සිංහලෙන් කතා කරනවා නම් සිංහලෙන්ම reply කරන්න
+2. ස්වාභාවික, කෙටි පණිවිඩ (2-3 වාක්‍ය පමණ)
+3. Casual Sinhala භාවිතා කරන්න: "ow", "තියනවා", "කමතිද"
+4. සෑම පණිවිඩයම "Dear 💙" එකද අවසන් කරන්න
 
-ව්‍යාවහාරික රටාව:
-- නිෂ්පාදන ගැන කතා කරන විට: නම, මිල, ප්‍රධාන විශේෂාංගය
-- "ඕඩර් කරන්න කැමතිද?" වගේ අවසන් ප්‍රශ්න අහන්න
-- Cash on Delivery තියෙනවා කියන්න
-- Casual Singlish භාවිතා කරන්න: "ow", "එකයි", "කමතිද"
+නිෂ්පාදන ගැන:
+- කෙටියෙන් නම, මිල කියන්න
+- වැඩි විස්තර අහනවා නම් විතරක් දෙන්න
 
-නිෂ්පාදන තිබේ නම්: ලබා දී ඇති නිශ්චිත තොරතුරු භාවිතා කරන්න (සිංහලෙන්)
-කිසිවිටෙක: තොරතුරු සාදන්න එපා"""
-        else:
-            system_prompt = """You are an excellent sales assistant. Your role:
+Delivery:
+- Delivery charge එක Rs.350 fixed
+- Cash on Delivery available
 
-1. Keep messages SHORT and helpful (2-4 sentences only)
-2. Give key product info - price, main features
-3. Be friendly and warm
+උදාහරණ:
+පරිශීලකයා: "Rack thiyanawadha?"
+ඔබ: "Ow dear, 4 layer rack thiyanawa. Rs.14,500\n\nDear 💙"
+
+Natural, friendly, casual Sinhala භාවිතා කරන්න!"""
+
+        elif language == "singlish":
+            system_prompt = """You are a friendly sales assistant.
+
+Key rules:
+1. Match user's Singlish style - mix Sinhala and English naturally
+2. Keep messages short and natural (2-3 sentences)
+3. Use casual tone: "ow", "thiyanawa", "kamathida"
 4. End every message with "Dear 💙"
 
-Conversational pattern:
-- When talking about products: name, price, key feature
-- Ask closing questions like "Would you like to order?"
-- Mention Cash on Delivery is available
-- Use casual tone
+About products:
+- Give name, price briefly
+- More details only if asked
 
-If products available: Use exact details provided
-Never: Make up information"""
+Delivery:
+- Delivery charge is Rs.350 fixed
+- Cash on Delivery available
 
-        # Add products context
+Example:
+User: "Rack thiyanawadha?"
+You: "Ow dear, 4 layer rack thiyanawa. Rs.14,500\n\nDear 💙"
+
+Be natural and friendly!"""
+
+        else:  # English
+            system_prompt = """You are a friendly sales assistant.
+
+Key rules:
+1. Keep messages short and natural (2-3 sentences)
+2. Be casual and friendly
+3. End every message with "Dear 💙"
+
+About products:
+- Give name, price briefly
+- More details only if asked
+
+Delivery:
+- Delivery charge is Rs.350 fixed
+- Cash on Delivery available
+
+Be natural and conversational!"""
+
+        # Add products context if available
         if products_context:
-            system_prompt += f"\n\nනිෂ්පාදන තොරතුරු:\n{products_context}"
+            system_prompt += f"\n\nProducts info:\n{products_context}"
 
         # Build messages for API
         messages = [{"role": "system", "content": system_prompt}]
 
-        # Add conversation history
-        for msg in history[-10:]:
+        # Add conversation history (last 6 for context)
+        for msg in history[-6:]:
             messages.append({"role": msg["role"], "content": msg["message"]})
 
         # Add current message
         messages.append({"role": "user", "content": user_message})
 
-        # Call OpenAI with SHORT max_tokens for concise responses
+        # Call OpenAI - short, natural responses
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            max_tokens=200,  # SHORT messages (2-4 sentences)
-            temperature=0.7
+            max_tokens=150,  # Short and sweet
+            temperature=0.8  # More natural/varied
         )
 
-        reply = response.choices[0].message.content
+        reply = response.choices[0].message.content.strip()
 
         # Ensure "Dear 💙" is at the end
-        if not reply.strip().endswith("Dear 💙"):
-            reply = reply.strip() + "\n\nDear 💙"
+        if not reply.endswith("Dear 💙"):
+            reply = reply + "\n\nDear 💙"
 
         return reply
 
     except Exception as e:
         print(f"OpenAI error: {e}", flush=True)
-        return "මට දැන් ප්‍රතිචාර දැක්වීමට අපහසුයි. කරුණාකර නැවත උත්සාහ කරන්න. Dear 💙"
+        if language == "sinhala" or language == "singlish":
+            return "මට දැන් ප්‍රතිචාර දැක්වීමට අපහසුයි. කරුණාකර නැවත උත්සාහ කරන්න. Dear 💙"
+        else:
+            return "Sorry, I'm having trouble right now. Please try again. Dear 💙"
 
 def get_products_for_ad(ad_id):
-    """Get products from Google Sheets for specific ad_id - RETURNS SINHALA TEXT"""
+    """Get products from Google Sheets for specific ad_id - Returns products and image URLs"""
     try:
         sheet = get_sheet()
         if not sheet:
-            return None
+            return None, []
 
         ad_products_sheet = sheet.worksheet("Ad_Products")
         records = ad_products_sheet.get_all_records()
 
         for row in records:
             if str(row.get("ad_id")) == str(ad_id):
-                # Build Sinhala product description
-                products_text = f"මෙම දැන්වීමේ නිෂ්පාදන:\n\n"
+                products_text = ""
+                image_urls = []
 
                 for i in range(1, 6):  # Up to 5 products
                     name_key = f"product_{i}_name"
                     price_key = f"product_{i}_price"
                     details_key = f"product_{i}_details"
+                    image_key = f"product_{i}_image_1"
 
                     if row.get(name_key):
-                        products_text += f"{i}. {row[name_key]}\n"
-                        products_text += f"   මිල: {row.get(price_key, 'N/A')}\n"
-                        products_text += f"   විස්තර: {row.get(details_key, 'N/A')}\n\n"
+                        products_text += f"{row[name_key]} - {row.get(price_key, 'N/A')}\n"
 
-                return products_text
+                        # Collect image URLs
+                        if row.get(image_key):
+                            img_url = row[image_key]
+                            if img_url and img_url.startswith("http"):
+                                image_urls.append(img_url)
 
-        return None
+                return products_text, image_urls
+
+        return None, []
 
     except Exception as e:
         print(f"Error getting products: {e}", flush=True)
-        return None
+        return None, []
 
-def send_product_images(sender_id, ad_id, page_token):
-    """Send product images at the start of conversation"""
+def send_product_images_for_ad(sender_id, ad_id, page_token):
+    """Send product images at the start of conversation from ad"""
     try:
         sheet = get_sheet()
         if not sheet:
@@ -347,18 +390,18 @@ def send_product_images(sender_id, ad_id, page_token):
         ad_products_sheet = sheet.worksheet("Ad_Products")
         records = ad_products_sheet.get_all_records()
 
-        # Find product images for this ad
         for row in records:
             if str(row.get("ad_id")) == str(ad_id):
-                # Send images for each product
+                # Send images for products in this ad
                 for i in range(1, 6):  # Up to 5 products
                     image_key = f"product_{i}_image_1"
-                    product_name = row.get(f"product_{i}_name")
 
-                    if row.get(image_key) and product_name:
+                    if row.get(image_key):
                         image_url = row[image_key]
                         if image_url and image_url.startswith("http"):
                             send_image(sender_id, image_url, page_token)
+
+                break
 
     except Exception as e:
         print(f"Error sending images: {e}", flush=True)
@@ -388,7 +431,7 @@ def send_image(recipient_id, image_url, page_token):
     print(f"Send image status: {r.status_code}, response: {r.text}", flush=True)
 
 def search_products_by_query(query):
-    """AI-powered product search for organic users"""
+    """AI-powered product search for organic users - Returns products and images"""
     try:
         # Extract keywords using OpenAI
         keyword_response = client.chat.completions.create(
@@ -405,37 +448,44 @@ def search_products_by_query(query):
         # Search in Google Sheets
         sheet = get_sheet()
         if not sheet:
-            return None
+            return None, []
 
         ad_products_sheet = sheet.worksheet("Ad_Products")
         records = ad_products_sheet.get_all_records()
 
         found_products = []
+        found_images = []
+
         for row in records:
             for i in range(1, 6):
                 name = str(row.get(f"product_{i}_name", "")).lower()
                 details = str(row.get(f"product_{i}_details", "")).lower()
 
-                if any(kw in name or kw in details for kw in keywords.split(",")):
-                    found_products.append({
+                if any(kw.strip() in name or kw.strip() in details for kw in keywords.split(",")):
+                    product_info = {
                         "name": row.get(f"product_{i}_name"),
                         "price": row.get(f"product_{i}_price"),
-                        "details": row.get(f"product_{i}_details")
-                    })
+                    }
+                    if product_info not in found_products:
+                        found_products.append(product_info)
+
+                        # Get image
+                        img_url = row.get(f"product_{i}_image_1")
+                        if img_url and img_url.startswith("http"):
+                            found_images.append(img_url)
 
         if found_products:
-            products_text = "Available products:\n\n"
-            for idx, prod in enumerate(found_products[:5], 1):
-                products_text += f"{idx}. {prod['name']}\n"
-                products_text += f"   Price: {prod['price']}\n"
-                products_text += f"   Details: {prod['details']}\n\n"
-            return products_text
+            products_text = ""
+            for prod in found_products[:5]:
+                products_text += f"{prod['name']} - {prod['price']}\n"
 
-        return None
+            return products_text, found_images[:5]
+
+        return None, []
 
     except Exception as e:
         print(f"Error in product search: {e}", flush=True)
-        return None
+        return None, []
 
 def save_message(sender_id, ad_id, role, message):
     """Save message to Conversations sheet"""
@@ -459,7 +509,7 @@ def save_message(sender_id, ad_id, role, message):
         print(f"Error saving message: {e}", flush=True)
 
 def get_conversation_history(sender_id):
-    """Get last 10 messages for this user"""
+    """Get last messages for this user"""
     try:
         sheet = get_sheet()
         if not sheet:
@@ -469,7 +519,7 @@ def get_conversation_history(sender_id):
         records = conversations_sheet.get_all_records()
 
         user_messages = [r for r in records if str(r.get("sender_id")) == str(sender_id)]
-        user_messages = user_messages[-10:]  # Last 10
+        user_messages = user_messages[-8:]  # Last 8 messages
 
         return [{"role": m["role"], "message": m["message"]} for m in user_messages if m["role"] in ["user", "assistant"]]
 
@@ -511,7 +561,7 @@ def save_lead(sender_id, ad_id, lead_info):
 
         # Check if lead exists
         row_index = None
-        for idx, record in enumerate(records, start=2):  # Start at 2 (header is row 1)
+        for idx, record in enumerate(records, start=2):
             if str(record.get("Sender ID")) == str(sender_id):
                 row_index = idx
                 break
@@ -534,7 +584,7 @@ def save_lead(sender_id, ad_id, lead_info):
                 lead_info.get('name', ''),
                 lead_info.get('address', ''),
                 lead_info.get('phone', ''),
-                "",  # Product Name (will be filled on order)
+                "",  # Product Name
                 timestamp,
                 "new"
             ])
@@ -559,19 +609,18 @@ def save_order_to_leads(sender_id, ad_id, lead_info, products_context):
                 row_index = idx
                 break
 
-        # Extract product name from products_context
+        # Extract product name
         product_name = "Order Placed"
         if products_context:
             lines = products_context.split('\n')
             for line in lines:
-                if line.strip() and not line.startswith('මෙම'):
-                    product_name = line.strip()[:50]
+                if line.strip():
+                    product_name = line.strip().split(' - ')[0][:50]
                     break
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if row_index:
-            # Update existing lead with order details
             leads_sheet.update_cell(row_index, 6, product_name)  # Product Name
             leads_sheet.update_cell(row_index, 7, timestamp)  # Date
             leads_sheet.update_cell(row_index, 8, "ordered")  # Status
