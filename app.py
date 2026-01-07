@@ -155,7 +155,7 @@ def handle_ad_referral(sender_id, ad_id, page_token):
 
 
 def handle_message(sender_id, text, page_token):
-    """Main message handler - AI-first with strict product validation"""
+    """Main message handler with intent understanding"""
     try:
         ad_id = get_user_ad_id(sender_id)
         save_message(sender_id, ad_id, "user", text)
@@ -163,14 +163,15 @@ def handle_message(sender_id, text, page_token):
         # Get products for ad if available
         products_context, product_images = get_products_for_ad(ad_id) if ad_id else (None, [])
         
-        # CRITICAL FIX: If no products for ad, search ALL products by query
+        # If no products for ad, search ALL products by query
         if not products_context:
             products_context, product_images = search_products_by_query(text)
-            print(f"No ad products, searched and found: {bool(products_context)}", flush=True)
+            print(f"Searched products, found: {bool(products_context)}", flush=True)
         
-        history = get_conversation_history(sender_id, limit=10)
+        # Get longer history for better context
+        history = get_conversation_history(sender_id, limit=30)
         
-        # CRITICAL: Check if user is sending complete contact details
+        # Check if user is sending complete contact details
         if detect_contact_details(text):
             handle_contact_details(sender_id, text, page_token, ad_id, products_context)
             return
@@ -200,10 +201,11 @@ def handle_message(sender_id, text, page_token):
                     save_message(sender_id, ad_id, "assistant", details_msg)
                     return
                 else:
-                    goodbye_msg = "Hari dear!\n\nDear 💙"
-                    send_message(sender_id, goodbye_msg, page_token)
-                    save_message(sender_id, ad_id, "assistant", goodbye_msg)
-                    del user_states[sender_id]
+                    # DON'T end with "Hari dear" - ask again
+                    retry_msg = "Prashna thiyanawada dear? Order karanna kamathi nam mata kiyanna.\n\nDear 💙"
+                    send_message(sender_id, retry_msg, page_token)
+                    save_message(sender_id, ad_id, "assistant", retry_msg)
+                    # Keep in same step
                     return
             
             # Collecting details
@@ -213,13 +215,29 @@ def handle_message(sender_id, text, page_token):
                     handle_contact_details(sender_id, text, page_token, ad_id, products_context)
                     return
 
+        # INTENT DETECTION - understand what user wants
+        intent = detect_intent(text, history)
+        print(f"🎯 Detected intent: {intent}", flush=True)
+
+        # Handle specific intents
+        if intent == "details":
+            handle_details_request(sender_id, products_context, page_token, ad_id)
+            return
+        elif intent == "height":
+            handle_height_request(sender_id, products_context, page_token, ad_id)
+            return
+        elif intent == "how_to_order":
+            handle_how_to_order(sender_id, page_token, ad_id)
+            return
+
         # Use AI for natural conversation
         reply = get_ai_response(text, history, products_context, product_images, sender_id, ad_id)
         
-        # Validate reply before sending
-        if not validate_reply(reply, products_context):
-            print(f"Invalid reply detected, regenerating...", flush=True)
-            reply = get_ai_response(text, history, products_context, product_images, sender_id, ad_id, retry=True)
+        # STRICT validation - reject hallucinations
+        validation_result = validate_reply_strict(reply, products_context, text)
+        if not validation_result["valid"]:
+            print(f"❌ Invalid reply: {validation_result['reason']}", flush=True)
+            reply = get_fallback_response(text, products_context, intent)
         
         # Check if AI wants to send images
         if "SEND_IMAGES" in reply:
@@ -245,28 +263,161 @@ def handle_message(sender_id, text, page_token):
         send_message(sender_id, "Sorry dear, issue ekak.\n\nDear 💙", page_token)
 
 
-def validate_reply(reply, products_context):
-    """Validate that reply doesn't hallucinate products"""
-    hallucination_patterns = [
-        r'රු\.\s*\d+,\d+',
-        r'Rs\.\s*\d+,\d+',
-        r'\d+-Tier',
-        r'Stainless Steel',
-        r'Wooden Rack'
+# ======================
+# Intent detection
+# ======================
+
+def detect_intent(text, history):
+    """Detect user intent from message"""
+    text_lower = text.lower()
+    
+    # Details/Visthara request
+    details_keywords = ["details", "visthara", "visthara denna", "thawa visthara", 
+                       "mata visthara", "more info", "info", "specification"]
+    if any(kw in text_lower for kw in details_keywords):
+        return "details"
+    
+    # Height/Size request
+    height_keywords = ["height", "uchayak", "height eka", "uyathai", "size", 
+                      "dimensions", "kiyada height"]
+    if any(kw in text_lower for kw in height_keywords):
+        return "height"
+    
+    # How to order
+    order_keywords = ["kohamada order", "kohomada order", "order karanne kohomada",
+                     "how to order", "order karanna", "order karanawada"]
+    if any(kw in text_lower for kw in order_keywords):
+        return "how_to_order"
+    
+    # Product list request
+    products_keywords = ["mona products", "products mona", "thiyanawada"]
+    if any(kw in text_lower for kw in products_keywords):
+        return "product_list"
+    
+    return "general"
+
+
+def handle_details_request(sender_id, products_context, page_token, ad_id):
+    """Handle when user asks for details/visthara"""
+    if products_context:
+        msg = f"Mehenna details!\n\n{products_context}\n\nOrder kamathi dha?\n\nDear 💙"
+        send_message(sender_id, msg, page_token)
+        save_message(sender_id, ad_id, "assistant", msg)
+    else:
+        msg = "Details nehe dear, mata message karanna.\n\nDear 💙"
+        send_message(sender_id, msg, page_token)
+        save_message(sender_id, ad_id, "assistant", msg)
+
+
+def handle_height_request(sender_id, products_context, page_token, ad_id):
+    """Handle when user asks for height"""
+    if products_context:
+        # Extract height from details if available
+        if "height" in products_context.lower() or "cm" in products_context.lower():
+            msg = f"Height details:\n\n{products_context}\n\nOrder kamathi dha?\n\nDear 💙"
+        else:
+            msg = f"Product details:\n\n{products_context}\n\nOrder kamathi dha?\n\nDear 💙"
+        send_message(sender_id, msg, page_token)
+        save_message(sender_id, ad_id, "assistant", msg)
+    else:
+        msg = "Height details nehe dear.\n\nDear 💙"
+        send_message(sender_id, msg, page_token)
+        save_message(sender_id, ad_id, "assistant", msg)
+
+
+def handle_how_to_order(sender_id, page_token, ad_id):
+    """Handle 'how to order' questions"""
+    msg = "Order karanna:\n1. Product select karanna\n2. Location ewanna\n3. Name, address, phone ewanna\n\nMata message karanna dear!\n\nDear 💙"
+    send_message(sender_id, msg, page_token)
+    save_message(sender_id, ad_id, "assistant", msg)
+
+
+def get_fallback_response(text, products_context, intent):
+    """Fallback response when AI fails validation"""
+    if intent == "product_list" or "mona" in text.lower():
+        if products_context:
+            return f"Mehenna products:\n\n{products_context}\n\nOrder kamathi dha? SEND_IMAGES START_LOCATION_FLOW\n\nDear 💙"
+        else:
+            return "Products nehe dear, mata message karanna.\n\nDear 💙"
+    
+    if "thiyanawadha" in text.lower() or "thiyanawada" in text.lower():
+        if products_context:
+            return f"Ow thiyanawa dear!\n\n{products_context}\n\nOrder kamathi dha? SEND_IMAGES START_LOCATION_FLOW\n\nDear 💙"
+        else:
+            return "Nehe dear, eka nehe.\n\nDear 💙"
+    
+    return "Mata message karanna dear!\n\nDear 💙"
+
+
+def validate_reply_strict(reply, products_context, user_message):
+    """STRICT validation to prevent hallucinations"""
+    
+    # Forbidden words - products we DON'T have
+    forbidden_words = [
+        "fridge", "refrigerator", "samsung", "lg", "microwave",
+        "gas cooker", "200l", "frost-free", "5 star", "warranty"
     ]
     
-    if products_context:
-        for pattern in hallucination_patterns:
-            if re.search(pattern, reply):
-                if not re.search(pattern, products_context):
-                    print(f"Hallucination detected: {pattern}", flush=True)
-                    return False
+    for word in forbidden_words:
+        if word in reply.lower():
+            # Check if this word is actually in products_context
+            if not products_context or word not in products_context.lower():
+                return {
+                    "valid": False,
+                    "reason": f"Mentioned forbidden product: {word}"
+                }
     
-    return True
+    # Check for product patterns
+    product_patterns = [
+        r'(\d+)\s*(?:Tier|Layer)',
+        r'(?:Stainless Steel|Wooden|Metal|Plastic)',
+        r'Rs\.?\s*\d+[,\d]*',
+        r'රු\.?\s*\d+[,\d]*',
+    ]
+    
+    for pattern in product_patterns:
+        matches = re.findall(pattern, reply, re.IGNORECASE)
+        if matches:
+            if products_context:
+                for match in matches:
+                    if str(match).lower() not in products_context.lower():
+                        return {
+                            "valid": False,
+                            "reason": f"Hallucinated: {match}"
+                        }
+            else:
+                return {
+                    "valid": False,
+                    "reason": "Mentioned products when none available"
+                }
+    
+    # Check yes/no questions
+    if "thiyanawadha" in user_message.lower() or "thiyanawada" in user_message.lower():
+        if "ow" not in reply.lower() and "nehe" not in reply.lower() and "නැහැ" not in reply and "ඔව්" not in reply:
+            return {
+                "valid": False,
+                "reason": "Didn't answer yes/no question"
+            }
+    
+    # Never say "Price on request"
+    if "price on request" in reply.lower() or "request" in reply.lower():
+        return {
+            "valid": False,
+            "reason": "Hallucinated 'price on request'"
+        }
+    
+    # Don't end conversation prematurely
+    if reply.strip() == "Hari dear!\n\nDear 💙":
+        return {
+            "valid": False,
+            "reason": "Ending conversation without asking for order"
+        }
+    
+    return {"valid": True, "reason": ""}
 
 
 # -------------
-# Intent helpers
+# Helper functions
 # -------------
 
 def detect_contact_details(text):
@@ -398,7 +549,7 @@ def save_complete_order(sender_id, ad_id, lead_info, products_context):
             "ordered",
         ])
 
-        print(f"Saved order: {lead_info}", flush=True)
+        print(f"✅ Saved order: {lead_info}", flush=True)
 
     except Exception as e:
         print(f"Error saving order: {e}", flush=True)
@@ -408,58 +559,44 @@ def save_complete_order(sender_id, ad_id, lead_info, products_context):
 # AI response generation
 # =========================
 
-def get_ai_response(user_message, history, products_context, product_images, sender_id, ad_id, retry=False):
-    """Generate natural AI response - STRICT anti-hallucination"""
+def get_ai_response(user_message, history, products_context, product_images, sender_id, ad_id):
+    """Generate natural AI response with strict rules"""
     try:
         system_prompt = """You are a friendly sales assistant for Social Mart Sri Lanka.
 
 CRITICAL LANGUAGE RULES:
-1. Use SIMPLE SINGLISH (2-4 words max per sentence)
-2. Mix Sinhala/English naturally: "ow dear", "thiyanawa", "kamathi dha"
-3. Keep responses SHORT (1-2 sentences ONLY)
+1. Use SIMPLE SINGLISH (2-4 words per sentence)
+2. Mix Sinhala/English naturally: "ow dear", "thiyanawa", "nehe"
+3. Keep responses SHORT (1-2 sentences)
 4. Always end with "Dear 💙"
-5. Sound natural like texting a friend
-
-SIMPLE SINGLISH EXAMPLES:
-✅ "Ow thiyanawa dear!"
-✅ "Price Rs.14,500."
-✅ "Delivery Rs.350, 3-5 days."
-❌ Long English sentences
 
 CRITICAL PRODUCT RULES - NEVER BREAK:
-1. ONLY mention products listed in "AVAILABLE PRODUCTS" section below
-2. Use EXACT product names and prices from the list
-3. If user asks about product NOT in list → say "Eka nehe dear" ONLY
-4. NEVER make up product names, prices, or details
-5. If no products available → say "Products nehe dear"
+1. ONLY mention products in "AVAILABLE PRODUCTS" below
+2. Use EXACT names and prices from the list
+3. If asked about product NOT in list → say "Nehe dear, eka nehe"
+4. NEVER invent: Fridge, Samsung, LG, Microwave, Gas Cooker, 200L, Frost-free
+5. NEVER say "Price on request"
 
-CONVERSATION HANDLING:
-1. Product questions ("mona products", "thiyanawada", "racks") → List from AVAILABLE PRODUCTS + add "SEND_IMAGES" + "START_LOCATION_FLOW"
-2. Photo requests → Say "Mehenna photos!" + add "SEND_IMAGES"
-3. Price questions → Give EXACT price from list
-4. Details questions → Use product_details from list
-5. COD questions → "Ow dear, COD thiyanawa!"
-6. Greetings → Respond warmly in 2-4 words
+ANSWER QUESTIONS DIRECTLY:
+- Details/Visthara → Give full product details from list
+- Height → Give height info if available in details
+- "X thiyanawadha?" → Answer "Ow thiyanawa" or "Nehe dear"
+- "Kohamada order karanai" → Explain: location ewanna, then details ewanna
+
+NEVER END WITH "Hari dear!" - Always ask: "Order kamathi dha?"
 
 """
 
         if products_context:
             system_prompt += f"\nAVAILABLE PRODUCTS (ONLY these exist):\n{products_context}\n"
-            system_prompt += "\n⚠️ NEVER mention products not in this list!"
+            system_prompt += "\n⚠️ CRITICAL: NEVER mention products not in this exact list!"
         else:
             system_prompt += "\nNO PRODUCTS AVAILABLE. Say: 'Products nehe dear, mata message karanna.'"
 
-        if retry:
-            system_prompt += "\n\n⚠️ RETRY: Previous response was invalid!"
-
-        if sender_id in user_states:
-            step = user_states[sender_id].get("step")
-            if step == "collect_details":
-                system_prompt += "\n\nUSER GIVING DETAILS: Ask for missing: name, address, phone."
-
         messages = [{"role": "system", "content": system_prompt}]
 
-        for msg in history[-6:]:
+        # Add more history for context
+        for msg in history[-12:]:
             messages.append({"role": msg["role"], "content": msg["message"]})
 
         messages.append({"role": "user", "content": user_message})
@@ -467,8 +604,8 @@ CONVERSATION HANDLING:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            max_tokens=60,
-            temperature=0.7,
+            max_tokens=80,
+            temperature=0.4,
         )
 
         reply = response.choices[0].message.content.strip()
@@ -533,7 +670,7 @@ def get_products_for_ad(ad_id):
 
 
 def search_products_by_query(query):
-    """Search ALL products in sheet by query - FALLBACK when no ad_id"""
+    """Search ALL products in sheet by query"""
     try:
         sheet = get_sheet()
         if not sheet:
@@ -542,26 +679,22 @@ def search_products_by_query(query):
         ad_products_sheet = sheet.worksheet("Ad_Products")
         records = ad_products_sheet.get_all_records()
 
-        # Extract keywords from query
         query_lower = query.lower()
         keywords = re.findall(r'\w+', query_lower)
 
         found_products = []
         found_images = []
 
-        # Search through ALL rows and products
         for row in records:
             for i in range(1, 6):
                 name = str(row.get(f"product_{i}_name", "")).lower()
                 
                 if name:
-                    # Check if any keyword matches product name
-                    if any(kw in name for kw in keywords):
+                    if any(kw in name for kw in keywords if len(kw) > 2):
                         prod_name = row.get(f"product_{i}_name")
                         prod_price = row.get(f"product_{i}_price")
                         prod_details = row.get(f"product_{i}_details", "")
 
-                        # Avoid duplicates
                         if prod_name and prod_name not in [p["name"] for p in found_products]:
                             found_products.append({
                                 "name": prod_name,
@@ -569,25 +702,23 @@ def search_products_by_query(query):
                                 "details": prod_details
                             })
 
-                            # Get images
                             for img_num in range(1, 4):
                                 img_url = row.get(f"product_{i}_image_{img_num}")
                                 if img_url and img_url.startswith("http"):
                                     found_images.append(img_url)
 
-        # If found products, format them
         if found_products:
             products_text = ""
-            for prod in found_products[:5]:  # Max 5 products
+            for prod in found_products[:5]:
                 products_text += f"{prod['name']} - {prod['price']}"
                 if prod['details']:
                     products_text += f"\n{prod['details']}"
                 products_text += "\n\n"
 
-            print(f"Found {len(found_products)} products for query: {query}", flush=True)
+            print(f"✅ Found {len(found_products)} products", flush=True)
             return products_text.strip(), found_images[:15]
 
-        # If no matches found, return ALL products
+        # No keyword matches - return ALL products
         all_products_text = ""
         all_images = []
         for row in records:
@@ -608,7 +739,7 @@ def search_products_by_query(query):
                             all_images.append(img_url)
 
         if all_products_text:
-            print(f"No keyword match, returning ALL products", flush=True)
+            print(f"ℹ️ Returning ALL products", flush=True)
             return all_products_text.strip(), all_images[:15]
 
         return None, []
@@ -668,8 +799,8 @@ def save_message(sender_id, ad_id, role, message):
         print(f"Error saving message: {e}", flush=True)
 
 
-def get_conversation_history(sender_id, limit=10):
-    """Get conversation history"""
+def get_conversation_history(sender_id, limit=30):
+    """Get conversation history - now supports 30 messages"""
     try:
         sheet = get_sheet()
         if not sheet:
