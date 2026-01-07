@@ -38,8 +38,80 @@ if PAGE_ID_3 and PAGE_ACCESS_TOKEN_3:
 # Initialize OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# User conversation state tracking - ENHANCED
+# User conversation state tracking
 user_states = {}
+
+# =====================
+# CACHING SYSTEM - NEW!
+# =====================
+
+# Cache for product data
+products_cache = {
+    "data": None,
+    "timestamp": 0,
+    "ttl": 300  # 5 minutes
+}
+
+# Cache for conversation history per user
+conversation_cache = {}
+CONVERSATION_CACHE_TTL = 60  # 1 minute
+
+
+def get_cached_products():
+    """Get products from cache or fetch if expired"""
+    current_time = time.time()
+    
+    if products_cache["data"] and (current_time - products_cache["timestamp"]) < products_cache["ttl"]:
+        print("✅ Using cached products", flush=True)
+        return products_cache["data"]
+    
+    # Fetch fresh data
+    print("📥 Fetching fresh products from sheet", flush=True)
+    sheet = get_sheet()
+    if not sheet:
+        return None
+    
+    try:
+        ad_products_sheet = sheet.worksheet("Ad_Products")
+        records = ad_products_sheet.get_all_records()
+        
+        # Update cache
+        products_cache["data"] = records
+        products_cache["timestamp"] = current_time
+        
+        print(f"✅ Cached {len(records)} product rows", flush=True)
+        return records
+    except Exception as e:
+        print(f"Error fetching products: {e}", flush=True)
+        return products_cache["data"]  # Return stale cache if error
+
+
+def get_cached_conversation_history(sender_id, limit=30):
+    """Get conversation history with caching"""
+    current_time = time.time()
+    cache_key = f"{sender_id}_{limit}"
+    
+    if cache_key in conversation_cache:
+        cached_data, cached_time = conversation_cache[cache_key]
+        if (current_time - cached_time) < CONVERSATION_CACHE_TTL:
+            print(f"✅ Using cached history for {sender_id}", flush=True)
+            return cached_data
+    
+    # Fetch fresh data
+    print(f"📥 Fetching fresh history for {sender_id}", flush=True)
+    history = get_conversation_history_from_sheet(sender_id, limit)
+    
+    # Update cache
+    conversation_cache[cache_key] = (history, current_time)
+    
+    return history
+
+
+def clear_conversation_cache(sender_id):
+    """Clear cache for a specific user when new message arrives"""
+    keys_to_delete = [k for k in conversation_cache.keys() if k.startswith(sender_id)]
+    for key in keys_to_delete:
+        del conversation_cache[key]
 
 
 # =====================
@@ -94,7 +166,7 @@ def update_user_context(sender_id, **kwargs):
 
 def extract_context_from_history(sender_id):
     """Extract context from conversation history"""
-    history = get_conversation_history(sender_id, limit=10)
+    history = get_cached_conversation_history(sender_id, limit=10)
     context = get_user_context(sender_id)
     
     for msg in reversed(history):
@@ -164,6 +236,10 @@ def webhook():
                     if event.get("message") and "text" in event["message"]:
                         text = event["message"]["text"]
                         print(f"Message from {sender_id}: {text}", flush=True)
+                        
+                        # Clear cache for this user
+                        clear_conversation_cache(sender_id)
+                        
                         handle_message(sender_id, text, page_token)
 
         return "EVENT_RECEIVED", 200
@@ -229,17 +305,15 @@ def handle_message(sender_id, text, page_token):
             update_user_context(sender_id, location=text)
             print(f"📍 Saved location: {text}", flush=True)
         
-        history = get_conversation_history(sender_id, limit=30)
+        history = get_cached_conversation_history(sender_id, limit=30)
         
         if detect_contact_details(text):
             handle_contact_details(sender_id, text, page_token, ad_id, products_context)
             return
 
-        # INTENT DETECTION - CHECK FIRST BEFORE FLOW
         intent = detect_intent(text, history)
         print(f"🎯 Intent: {intent}, Step: {context.get('step')}", flush=True)
 
-        # Handle specific intents BEFORE flow - CLEAR STUCK STATES
         if intent == "product_availability":
             update_user_context(sender_id, step=None, order_retry_count=0)
             handle_availability_request(sender_id, text, products_context, product_images, page_token, ad_id, context)
@@ -265,7 +339,6 @@ def handle_message(sender_id, text, page_token):
             handle_how_to_order(sender_id, page_token, ad_id)
             return
 
-        # Flow management
         step = context.get("step")
         
         if step == "ask_location":
@@ -290,7 +363,6 @@ def handle_message(sender_id, text, page_token):
         elif step == "ask_order":
             wants_order = check_agreement(text)
             
-            # User asking NEW question instead of answering
             if "thiyanawada" in text.lower() or "thiyanawadha" in text.lower():
                 update_user_context(sender_id, step=None, order_retry_count=0)
                 handle_availability_request(sender_id, text, products_context, product_images, page_token, ad_id, context)
@@ -326,7 +398,6 @@ def handle_message(sender_id, text, page_token):
                 handle_contact_details(sender_id, text, page_token, ad_id, products_context)
                 return
 
-        # Use AI for general conversation
         reply = get_ai_response(text, history, products_context, product_images, sender_id, ad_id, context)
         
         validation_result = validate_reply_strict(reply, products_context, text)
@@ -362,7 +433,6 @@ def detect_intent(text, history):
     """Detect user intent from message"""
     text_lower = text.lower()
     
-    # Product availability - CHECK FIRST
     availability_keywords = ["thiyanawada", "thiyanawadha", "ithiri thiyanawada", "stock thiyanawada", "available da"]
     if any(kw in text_lower for kw in availability_keywords):
         return "product_availability"
@@ -487,7 +557,6 @@ def handle_availability_request(sender_id, user_text, products_context, product_
             save_message(sender_id, ad_id, "assistant", msg)
             return
     
-    # Generic "thiyanawada" without product
     if products_context:
         msg = f"Ow thiyanawa dear!\n\n{products_context}\n\nDear 💙"
     else:
@@ -554,14 +623,11 @@ def handle_photo_request(sender_id, user_text, products_context, product_images,
 
 
 def get_specific_product_images(product_keyword, ad_id):
-    """Get images for a specific product only"""
+    """Get images for a specific product only - USES CACHE"""
     try:
-        sheet = get_sheet()
-        if not sheet:
+        records = get_cached_products()
+        if not records:
             return []
-
-        ad_products_sheet = sheet.worksheet("Ad_Products")
-        records = ad_products_sheet.get_all_records()
 
         for row in records:
             if str(row.get("ad_id")) == str(ad_id) or not ad_id:
@@ -609,7 +675,7 @@ def handle_details_request(sender_id, user_text, products_context, product_image
         specific_product = extract_product_from_query(user_text)
         
         if not specific_product:
-            history = get_conversation_history(sender_id, limit=5)
+            history = get_cached_conversation_history(sender_id, limit=5)
             
             for msg in reversed(history[-6:]):
                 if msg["role"] == "user":
@@ -949,18 +1015,15 @@ DON'T ask "Order kamathi dha?" in every message!
 
 
 # =========================
-# Product data from sheets
+# Product data from sheets - WITH CACHING
 # =========================
 
 def get_products_for_ad(ad_id):
-    """Get products and images for specific ad"""
+    """Get products and images for specific ad - USES CACHE"""
     try:
-        sheet = get_sheet()
-        if not sheet:
+        records = get_cached_products()
+        if not records:
             return None, []
-
-        ad_products_sheet = sheet.worksheet("Ad_Products")
-        records = ad_products_sheet.get_all_records()
 
         for row in records:
             if str(row.get("ad_id")) == str(ad_id):
@@ -998,14 +1061,11 @@ def get_products_for_ad(ad_id):
 
 
 def search_products_by_query(query):
-    """Search ALL products in sheet by query"""
+    """Search ALL products in sheet by query - USES CACHE"""
     try:
-        sheet = get_sheet()
-        if not sheet:
+        records = get_cached_products()
+        if not records:
             return None, []
-
-        ad_products_sheet = sheet.worksheet("Ad_Products")
-        records = ad_products_sheet.get_all_records()
 
         query_lower = query.lower()
         keywords = re.findall(r'\w+', query_lower)
@@ -1103,8 +1163,8 @@ def save_message(sender_id, ad_id, role, message):
         print(f"Error saving message: {e}", flush=True)
 
 
-def get_conversation_history(sender_id, limit=30):
-    """Get conversation history"""
+def get_conversation_history_from_sheet(sender_id, limit=30):
+    """Get conversation history FROM SHEET (not cached)"""
     try:
         sheet = get_sheet()
         if not sheet:
