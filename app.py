@@ -47,6 +47,13 @@ client = OpenAI(
 user_states = {}
 
 # =====================
+# EVENT DEDUPLICATION - NEW!
+# =====================
+
+processed_events = {}
+EVENT_CACHE_TTL = 300  # 5 minutes
+
+# =====================
 # CACHING SYSTEM
 # =====================
 
@@ -58,13 +65,6 @@ products_cache = {
 
 conversation_cache = {}
 CONVERSATION_CACHE_TTL = 60
-
-# =====================
-# EVENT DEDUPLICATION - NEW!
-# =====================
-
-processed_events = {}
-EVENT_CACHE_TTL = 300  # 5 minutes
 
 
 def get_cached_products():
@@ -238,45 +238,17 @@ def webhook():
                 messaging_events = entry.get("messaging", [])
                 for event in messaging_events:
                     sender_id = event["sender"]["id"]
-                    
-                    # =====================
-                    # DEDUPLICATION LOGIC - PREVENTS DUPLICATE MESSAGES
-                    # =====================
-                    event_id = None
-                    if event.get("message"):
-                        event_id = event["message"].get("mid")
-                    elif event.get("referral"):
-                        event_id = f"ref_{sender_id}_{event['referral'].get('ref')}_{event.get('timestamp')}"
-                    
-                    if event_id:
-                        current_time = time.time()
-                        
-                        # Check if already processed
-                        if event_id in processed_events:
-                            if (current_time - processed_events[event_id]) < EVENT_CACHE_TTL:
-                                print(f"⚠️ Skipping duplicate event: {event_id}", flush=True)
-                                continue
-                        
-                        # Mark as processed
-                        processed_events[event_id] = current_time
-                        
-                        # Clean old events from cache
-                        processed_events_copy = dict(processed_events)
-                        for old_id, old_time in processed_events_copy.items():
-                            if (current_time - old_time) > EVENT_CACHE_TTL:
-                                del processed_events[old_id]
-                    
-                    # Handle referral (initial ad click) - ONLY if no message present
-                    if "referral" in event and "message" not in event:
+
+                    if "referral" in event:
                         ad_id = event["referral"].get("ref")
                         handle_ad_referral(sender_id, ad_id, page_token)
-                    
-                    # Handle regular messages
-                    elif event.get("message") and "text" in event["message"]:
+
+                    if event.get("message") and "text" in event["message"]:
                         text = event["message"]["text"]
                         print(f"Message from {sender_id}: {text}", flush=True)
                         
                         clear_conversation_cache(sender_id)
+                        
                         handle_message(sender_id, text, page_token)
 
         return "EVENT_RECEIVED", 200
